@@ -1,0 +1,6 @@
+{
+  "name": "RectiLab — Interactive Power Electronics & Rectifier Workbench",
+  "description": "Interactive power electronics simulator for 1-phase and 3-phase half-wave and full-wave diode bridge and thyristor phase-controlled rectifiers with live schematics and oscilloscope waveforms.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
