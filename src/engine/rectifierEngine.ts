@@ -54,11 +54,13 @@ export interface SimulationMetrics {
   Vrms: number;
   Idc: number;
   Irms: number;
-  Pdc: number;
-  Pac: number;
+  Pout: number; // Actual average output load power: mean(vo * io)
+  Pin: number; // Actual average input real power: mean(va * ia + vb * ib + vc * ic)
+  Pdc: number; // DC component product: Vdc * Idc
+  Pac: number; // Input AC real power (= Pin)
   formFactor: number;
   rippleFactorPercent: number;
-  efficiencyPercent: number;
+  efficiencyPercent: number | null;
   piv: number;
   pulseNumber: number;
   conductionMode: 'CCM' | 'DCM' | 'INVERTER';
@@ -79,7 +81,34 @@ export interface SimulationResult {
 }
 
 const DEG_TO_RAD = Math.PI / 180;
-const RAD_TO_DEG = 180 / Math.PI;
+
+/**
+ * Exact analytical step for a linear RL branch driven by a sinusoid of frequency omega
+ * (where d^2v/dtheta^2 = -v) or by 0V during freewheeling:
+ *   XL * di/dtheta + R * i = v(theta)
+ */
+function integrateRLBranchStep(
+  i0: number,
+  dRad: number,
+  R: number,
+  XL: number,
+  v0: number,
+  dv0: number,
+  v1: number,
+  dv1: number
+): number {
+  if (XL <= 1e-12) {
+    return Math.max(0, v1 / R);
+  }
+  const decay = Math.exp((-R / XL) * dRad);
+  if (v0 === 0 && dv0 === 0 && v1 === 0 && dv1 === 0) {
+    return i0 * decay;
+  }
+  const zSq = R * R + XL * XL;
+  const ip0 = (R * v0 - XL * dv0) / zSq;
+  const ip1 = (R * v1 - XL * dv1) / zSq;
+  return ip1 + (i0 - ip0) * decay;
+}
 
 export function runRectifierSimulation(params: SimulationParams): SimulationResult {
   const {
@@ -96,47 +125,146 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
 
   // Enforce alpha = 0 for uncontrolled diode rectifiers
   const maxAlpha = phases === '3p' && waveType === 'half' ? 150 : 165;
-  const effectiveAlphaDeg = deviceType === 'diode' ? 0 : Math.min(Math.max(0, params.alphaDeg), maxAlpha);
-  const alphaRad = effectiveAlphaDeg * DEG_TO_RAD;
+  const effectiveAlphaDeg =
+    deviceType === 'diode' ? 0 : Math.min(Math.max(0, params.alphaDeg), maxAlpha);
 
   const omega = 2 * Math.PI * freq;
-  const effectiveL = loadType === 'R' ? 0 : L_mH / 1000;
-  const dDeg = 0.5; // 0.5 degree simulation step for high accuracy
+  // Coupled high-inductance RL model for RL_CONST (XL = 100 * R) vs finite RL (L_mH / 1000)
+  const effectiveL =
+    loadType === 'R'
+      ? 0
+      : loadType === 'RL_CONST'
+        ? (100 * R) / omega
+        : Math.max(1e-6, L_mH / 1000);
+  const XL = omega * effectiveL;
+
+  const dDeg = 0.5; // 0.5 degree simulation step
   const dRad = dDeg * DEG_TO_RAD;
-  const dt = dRad / omega;
-
-  // Simulate 4 full cycles (0 to 1440 deg) so RL transients settle into steady-state
-  const totalCycles = 4;
   const stepsPerCycle = Math.round(360 / dDeg);
-  const totalSteps = totalCycles * stepsPerCycle;
 
-  let io = 0;
-  let activeState = 'NONE'; // Tracks which switch or pair is currently conducting
-
-  // Helper for source voltages at any angle in degrees
+  // Helper for source voltages and their angular derivatives dv/dtheta at any angle in degrees
   const getVoltages = (deg: number) => {
     const rad = deg * DEG_TO_RAD;
+    const twoPiOver3 = (2 * Math.PI) / 3;
+    const fourPiOver3 = (4 * Math.PI) / 3;
+
     const va = Vm * Math.sin(rad);
-    const vb = Vm * Math.sin(rad - (2 * Math.PI) / 3);
-    const vc = Vm * Math.sin(rad - (4 * Math.PI) / 3);
+    const dva = Vm * Math.cos(rad);
+
+    const vb = Vm * Math.sin(rad - twoPiOver3);
+    const dvb = Vm * Math.cos(rad - twoPiOver3);
+
+    const vc = Vm * Math.sin(rad - fourPiOver3);
+    const dvc = Vm * Math.cos(rad - fourPiOver3);
+
     const vab = va - vb;
+    const dvab = dva - dvb;
     const vac = va - vc;
+    const dvac = dva - dvc;
     const vbc = vb - vc;
+    const dvbc = dvb - dvc;
     const vba = vb - va;
+    const dvba = dvb - dva;
     const vca = vc - va;
+    const dvca = dvc - dva;
     const vcb = vc - vb;
-    return { rad, va, vb, vc, vab, vac, vbc, vba, vca, vcb };
+    const dvcb = dvc - dvb;
+
+    return {
+      rad,
+      va,
+      dva,
+      vb,
+      dvb,
+      vc,
+      dvc,
+      vab,
+      dvab,
+      vac,
+      dvac,
+      vbc,
+      dvbc,
+      vba,
+      dvba,
+      vca,
+      dvca,
+      vcb,
+      dvcb,
+    };
   };
 
   const prefix = deviceType === 'diode' ? 'D' : 'T';
 
-  // Store last 2 cycles (720 degrees, 1 degree spacing -> 721 points)
-  const rawSteadyState: WaveformPoint[] = [];
+  // Returns the instantaneous driving voltage (v, dv/dtheta) for a given active switch state
+  const getBranchVoltageForState = (
+    state: string,
+    v: ReturnType<typeof getVoltages>
+  ): { vBranch: number; dvBranch: number } => {
+    switch (state) {
+      case 'S1':
+      case 'P12':
+        return { vBranch: v.va, dvBranch: v.dva };
+      case 'P34':
+        return { vBranch: -v.va, dvBranch: -v.dva };
+      case 'S2':
+        return { vBranch: v.vb, dvBranch: v.dvb };
+      case 'S3':
+        return { vBranch: v.vc, dvBranch: v.dvc };
+      case 'B0':
+        return { vBranch: v.vab, dvBranch: v.dvab };
+      case 'B1':
+        return { vBranch: v.vac, dvBranch: v.dvac };
+      case 'B2':
+        return { vBranch: v.vbc, dvBranch: v.dvbc };
+      case 'B3':
+        return { vBranch: v.vba, dvBranch: v.dvba };
+      case 'B4':
+        return { vBranch: v.vca, dvBranch: v.dvca };
+      case 'B5':
+        return { vBranch: v.vcb, dvBranch: v.dvcb };
+      case 'FW':
+      default:
+        return { vBranch: 0, dvBranch: 0 };
+    }
+  };
 
-  for (let step = 0; step <= totalSteps; step++) {
-    const absDeg = step * dDeg;
+  let io = 0;
+  let activeState = 'NONE';
+
+  // Advance the simulation by one step (from absDeg - dDeg to absDeg) and evaluate state at absDeg
+  const stepSimulation = (absDeg: number, advanceCurrent: boolean): WaveformPoint => {
     const degMod360 = ((absDeg % 360) + 360) % 360;
     const v = getVoltages(absDeg);
+
+    // 1. Advance inductive load current from previous angle (absDeg - dDeg) to absDeg
+    if (advanceCurrent && loadType !== 'R' && activeState !== 'NONE') {
+      const vPrev = getVoltages(absDeg - dDeg);
+      const { vBranch: v0, dvBranch: dv0 } = getBranchVoltageForState(activeState, vPrev);
+      const { vBranch: v1, dvBranch: dv1 } = getBranchVoltageForState(activeState, v);
+
+      // Handle zero-crossing into freewheeling inside the step if Dfw is connected
+      if (freewheelingDiode && activeState !== 'FW' && v0 > 0 && v1 < 0) {
+        const fz = v0 / (v0 - v1);
+        const degZ = absDeg - dDeg + fz * dDeg;
+        const vZ = getVoltages(degZ);
+        const { vBranch: vzVal, dvBranch: dvzVal } = getBranchVoltageForState(activeState, vZ);
+        const ioAtZ = integrateRLBranchStep(io, fz * dRad, R, XL, v0, dv0, vzVal, dvzVal);
+        if (ioAtZ > 1e-9) {
+          activeState = 'FW';
+          io = integrateRLBranchStep(ioAtZ, (1 - fz) * dRad, R, XL, 0, 0, 0, 0);
+        } else {
+          io = 0;
+          activeState = 'NONE';
+        }
+      } else {
+        io = integrateRLBranchStep(io, dRad, R, XL, v0, dv0, v1, dv1);
+      }
+
+      if (io <= 1e-9) {
+        io = 0;
+        activeState = 'NONE';
+      }
+    }
 
     let vo = 0;
     let activeDevices: string[] = [];
@@ -157,68 +285,41 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
         gatePulse = 1;
       }
 
-      // Trigger condition: angle >= alpha in positive half cycle
-      const canTrigger = degMod360 >= effectiveAlphaDeg && degMod360 < 180 && v.va > 0;
-      if (canTrigger && (activeState === 'NONE' || activeState === 'FW')) {
-        activeState = 'S1';
-      }
-
-      // Check freewheeling transition when va drops below 0
-      if (activeState === 'S1' && v.va < 0 && freewheelingDiode && (io > 0 || loadType === 'RL_CONST')) {
-        activeState = 'FW';
-      }
+      const inTriggerWindow =
+        degMod360 >= effectiveAlphaDeg &&
+        degMod360 < 180 &&
+        (v.va > 0 || (v.va >= -1e-9 && v.dva > 0));
 
       if (loadType === 'R') {
-        if (degMod360 >= effectiveAlphaDeg && degMod360 <= 180 && v.va > 0) {
-          vo = v.va;
-          io = vo / R;
+        if (inTriggerWindow) {
           activeState = 'S1';
+          vo = Math.max(0, v.va);
+          io = vo / R;
         } else {
+          activeState = 'NONE';
           vo = 0;
           io = 0;
-          activeState = 'NONE';
-        }
-      } else if (loadType === 'RL_CONST') {
-        // Constant current approx for 1p half wave (only physical with freewheeling diode, or large L)
-        if (degMod360 >= effectiveAlphaDeg && degMod360 < 180) {
-          vo = v.va;
-          activeState = 'S1';
-        } else if (freewheelingDiode) {
-          vo = 0;
-          activeState = 'FW';
-        } else {
-          // Without Dfw, current extinguishes before 360
-          const betaCheck = 360 - effectiveAlphaDeg;
-          if (degMod360 >= effectiveAlphaDeg && degMod360 <= Math.min(340, betaCheck)) {
-            vo = v.va;
-            activeState = 'S1';
-          } else {
-            vo = 0;
-            activeState = 'NONE';
-          }
         }
       } else {
-        // Exact RL integration
+        if (inTriggerWindow) {
+          activeState = 'S1';
+        } else if (
+          activeState === 'S1' &&
+          freewheelingDiode &&
+          (v.va < 0 || (v.va <= 1e-9 && v.dva < 0))
+        ) {
+          activeState = io > 1e-9 ? 'FW' : 'NONE';
+        }
+
+        if (activeState !== 'S1' && activeState !== 'FW') {
+          activeState = 'NONE';
+          io = 0;
+        }
+
         if (activeState === 'S1') {
           vo = v.va;
-          const dio = ((vo - R * io) / effectiveL) * dt;
-          io = io + dio;
-          if (io <= 0 && degMod360 > effectiveAlphaDeg + 2) {
-            io = 0;
-            vo = 0;
-            activeState = 'NONE';
-          }
-        } else if (activeState === 'FW') {
-          vo = 0;
-          const dio = ((-R * io) / effectiveL) * dt;
-          io = io + dio;
-          if (io <= 0) {
-            io = 0;
-            activeState = 'NONE';
-          }
         } else {
           vo = 0;
-          io = 0;
         }
       }
 
@@ -246,60 +347,59 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
       const trig1 = effectiveAlphaDeg;
       const trig2 = (180 + effectiveAlphaDeg) % 360;
 
-      const p1 = Math.abs(degMod360 - trig1) < 4 || (degMod360 >= trig1 && degMod360 <= trig1 + 7);
-      const p2 = Math.abs(degMod360 - trig2) < 4 || (degMod360 >= trig2 && degMod360 <= trig2 + 7);
+      const p1 =
+        Math.abs(degMod360 - trig1) < 4 || (degMod360 >= trig1 && degMod360 <= trig1 + 7);
+      const p2 =
+        Math.abs(degMod360 - trig2) < 4 || (degMod360 >= trig2 && degMod360 <= trig2 + 7);
       if (deviceType === 'scr' && (p1 || p2)) {
         gatePulse = 1;
       }
 
-      // Determine natural active pair based on firing angle
-      const inSlot1 = degMod360 >= effectiveAlphaDeg && degMod360 < 180 + effectiveAlphaDeg;
+      const inPosSlot1 =
+        degMod360 >= effectiveAlphaDeg &&
+        degMod360 < 180 &&
+        (v.va > 0 || (v.va >= -1e-9 && v.dva > 0));
+      const inPosSlot2 =
+        degMod360 >= 180 + effectiveAlphaDeg &&
+        degMod360 < 360 &&
+        (-v.va > 0 || (-v.va >= -1e-9 && -v.dva > 0));
 
       if (loadType === 'R') {
-        if (inSlot1 && v.va > 0) {
-          vo = v.va;
-          io = vo / R;
+        if (inPosSlot1) {
           activeState = 'P12';
-        } else if (!inSlot1 && -v.va > 0) {
-          vo = -v.va;
+          vo = Math.max(0, v.va);
           io = vo / R;
+        } else if (inPosSlot2) {
           activeState = 'P34';
+          vo = Math.max(0, -v.va);
+          io = vo / R;
         } else {
+          activeState = 'NONE';
           vo = 0;
           io = 0;
-          activeState = 'NONE';
-        }
-      } else if (loadType === 'RL_CONST') {
-        if (inSlot1) {
-          if (freewheelingDiode && v.va < 0) {
-            vo = 0;
-            activeState = 'FW';
-          } else {
-            vo = v.va;
-            activeState = 'P12';
-          }
-        } else {
-          if (freewheelingDiode && -v.va < 0) {
-            vo = 0;
-            activeState = 'FW';
-          } else {
-            vo = -v.va;
-            activeState = 'P34';
-          }
         }
       } else {
-        // Finite RL load
-        if (inSlot1 && degMod360 < 180 && v.va > 0) {
+        if (inPosSlot1) {
           activeState = 'P12';
-        } else if (!inSlot1 && ((degMod360 >= 180 + effectiveAlphaDeg && degMod360 < 360) || degMod360 < effectiveAlphaDeg) && -v.va > 0) {
+        } else if (inPosSlot2) {
           activeState = 'P34';
+        } else if (
+          activeState === 'P12' &&
+          freewheelingDiode &&
+          (v.va < 0 || (v.va <= 1e-9 && v.dva < 0))
+        ) {
+          activeState = io > 1e-9 ? 'FW' : 'NONE';
+        } else if (
+          activeState === 'P34' &&
+          freewheelingDiode &&
+          (-v.va < 0 || (-v.va <= 1e-9 && -v.dva < 0))
+        ) {
+          activeState = io > 1e-9 ? 'FW' : 'NONE';
         }
 
-        // Check freewheeling clamp
-        if (activeState === 'P12' && v.va < 0 && freewheelingDiode && io > 0) {
-          activeState = 'FW';
-        } else if (activeState === 'P34' && -v.va < 0 && freewheelingDiode && io > 0) {
-          activeState = 'FW';
+        if (activeState !== 'P12' && activeState !== 'P34' && activeState !== 'FW') {
+          activeState = 'NONE';
+          io = 0;
         }
 
         if (activeState === 'P12') {
@@ -307,19 +407,6 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
         } else if (activeState === 'P34') {
           vo = -v.va;
         } else {
-          vo = 0;
-        }
-
-        if (activeState !== 'NONE') {
-          const dio = ((vo - R * io) / effectiveL) * dt;
-          io = io + dio;
-          if (io <= 0) {
-            io = 0;
-            vo = 0;
-            activeState = 'NONE';
-          }
-        } else {
-          io = 0;
           vo = 0;
         }
       }
@@ -350,7 +437,6 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
     // 3. THREE-PHASE HALF-WAVE (3p + half, 3-Pulse Star)
     // =========================================================================
     else if (phases === '3p' && waveType === 'half') {
-      // Natural commutation points: 30 deg (Phase A), 150 deg (Phase B), 270 deg (Phase C)
       const tA = (30 + effectiveAlphaDeg) % 360;
       const tB = (150 + effectiveAlphaDeg) % 360;
       const tC = (270 + effectiveAlphaDeg) % 360;
@@ -363,64 +449,64 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
         gatePulse = 1;
       }
 
-      // Shift angle relative to 30 + alpha to find active 120-deg sector
       const relDeg = (((degMod360 - (30 + effectiveAlphaDeg)) % 360) + 360) % 360;
       let sectorPhase: 'S1' | 'S2' | 'S3' = 'S1';
       let vSector = v.va;
+      let dvSector = v.dva;
       if (relDeg < 120) {
         sectorPhase = 'S1';
         vSector = v.va;
+        dvSector = v.dva;
       } else if (relDeg < 240) {
         sectorPhase = 'S2';
         vSector = v.vb;
+        dvSector = v.dvb;
       } else {
         sectorPhase = 'S3';
         vSector = v.vc;
+        dvSector = v.dvc;
       }
 
+      const sectorPositive = vSector > 0 || (vSector >= -1e-9 && dvSector > 0);
+
       if (loadType === 'R') {
-        if (vSector > 0) {
-          vo = vSector;
-          io = vo / R;
+        if (sectorPositive) {
           activeState = sectorPhase;
+          vo = Math.max(0, vSector);
+          io = vo / R;
         } else {
+          activeState = 'NONE';
           vo = 0;
           io = 0;
-          activeState = 'NONE';
-        }
-      } else if (loadType === 'RL_CONST') {
-        if (freewheelingDiode && vSector < 0) {
-          vo = 0;
-          activeState = 'FW';
-        } else {
-          vo = vSector;
-          activeState = sectorPhase;
         }
       } else {
-        // Finite RL
-        if (vSector > 0) {
+        if (sectorPositive) {
           activeState = sectorPhase;
-        } else if (activeState === sectorPhase && freewheelingDiode && io > 0) {
-          activeState = 'FW';
+        } else {
+          const { vBranch: vCur, dvBranch: dvCur } = getBranchVoltageForState(activeState, v);
+          if (
+            (activeState === 'S1' || activeState === 'S2' || activeState === 'S3') &&
+            freewheelingDiode &&
+            (vCur < 0 || (vCur <= 1e-9 && dvCur < 0))
+          ) {
+            activeState = io > 1e-9 ? 'FW' : 'NONE';
+          }
+        }
+
+        if (
+          activeState !== 'S1' &&
+          activeState !== 'S2' &&
+          activeState !== 'S3' &&
+          activeState !== 'FW'
+        ) {
+          activeState = 'NONE';
+          io = 0;
         }
 
         if (activeState === 'S1') vo = v.va;
         else if (activeState === 'S2') vo = v.vb;
         else if (activeState === 'S3') vo = v.vc;
         else vo = 0;
-
-        if (activeState !== 'NONE') {
-          const dio = ((vo - R * io) / effectiveL) * dt;
-          io = io + dio;
-          if (io <= 0) {
-            io = 0;
-            vo = 0;
-            activeState = 'NONE';
-          }
-        } else {
-          io = 0;
-          vo = 0;
-        }
       }
 
       if (activeState === 'S1') {
@@ -454,73 +540,60 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
     // 4. THREE-PHASE FULL-WAVE BRIDGE (3p + full, 6-Pulse B6 Bridge)
     // =========================================================================
     else {
-      // 6 commutation intervals of 60 deg starting at 30 + alpha
       const relDeg = (((degMod360 - (30 + effectiveAlphaDeg)) % 360) + 360) % 360;
-      const sectorIdx = Math.floor(relDeg / 60); // 0..5
+      const sectorIdx = Math.min(5, Math.floor(relDeg / 60)); // 0..5
       const degInSector = relDeg % 60;
 
       if (deviceType === 'scr' && degInSector <= 5) {
         gatePulse = 1;
       }
 
-      // Map sector index 0..5 to standard IEEE 6-pulse switch pairs and line voltages
-      // 0: T1 + T6 (Vab), 1: T1 + T2 (Vac), 2: T3 + T2 (Vbc),
-      // 3: T3 + T4 (Vba), 4: T5 + T4 (Vca), 5: T5 + T6 (Vcb)
       const sectorMap = [
-        { state: 'B0', devs: [`${prefix}1`, `${prefix}6`], label: `${prefix}1 + ${prefix}6 (Vab)`, vLine: v.vab, pPos: 'A', pNeg: 'B' },
-        { state: 'B1', devs: [`${prefix}1`, `${prefix}2`], label: `${prefix}1 + ${prefix}2 (Vac)`, vLine: v.vac, pPos: 'A', pNeg: 'C' },
-        { state: 'B2', devs: [`${prefix}3`, `${prefix}2`], label: `${prefix}3 + ${prefix}2 (Vbc)`, vLine: v.vbc, pPos: 'B', pNeg: 'C' },
-        { state: 'B3', devs: [`${prefix}3`, `${prefix}4`], label: `${prefix}3 + ${prefix}4 (Vba)`, vLine: v.vba, pPos: 'B', pNeg: 'A' },
-        { state: 'B4', devs: [`${prefix}5`, `${prefix}4`], label: `${prefix}5 + ${prefix}4 (Vca)`, vLine: v.vca, pPos: 'C', pNeg: 'A' },
-        { state: 'B5', devs: [`${prefix}5`, `${prefix}6`], label: `${prefix}5 + ${prefix}6 (Vcb)`, vLine: v.vcb, pPos: 'C', pNeg: 'B' },
+        { state: 'B0', devs: [`${prefix}1`, `${prefix}6`], label: `${prefix}1 + ${prefix}6 (Vab)`, vLine: v.vab, dvLine: v.dvab, pPos: 'A', pNeg: 'B' },
+        { state: 'B1', devs: [`${prefix}1`, `${prefix}2`], label: `${prefix}1 + ${prefix}2 (Vac)`, vLine: v.vac, dvLine: v.dvac, pPos: 'A', pNeg: 'C' },
+        { state: 'B2', devs: [`${prefix}3`, `${prefix}2`], label: `${prefix}3 + ${prefix}2 (Vbc)`, vLine: v.vbc, dvLine: v.dvbc, pPos: 'B', pNeg: 'C' },
+        { state: 'B3', devs: [`${prefix}3`, `${prefix}4`], label: `${prefix}3 + ${prefix}4 (Vba)`, vLine: v.vba, dvLine: v.dvba, pPos: 'B', pNeg: 'A' },
+        { state: 'B4', devs: [`${prefix}5`, `${prefix}4`], label: `${prefix}5 + ${prefix}4 (Vca)`, vLine: v.vca, dvLine: v.dvca, pPos: 'C', pNeg: 'A' },
+        { state: 'B5', devs: [`${prefix}5`, `${prefix}6`], label: `${prefix}5 + ${prefix}6 (Vcb)`, vLine: v.vcb, dvLine: v.dvcb, pPos: 'C', pNeg: 'B' },
       ];
 
       const activeSector = sectorMap[sectorIdx] || sectorMap[0];
+      const sectorPositive =
+        activeSector.vLine > 0 || (activeSector.vLine >= -1e-9 && activeSector.dvLine > 0);
 
       if (loadType === 'R') {
-        if (activeSector.vLine > 0) {
-          vo = activeSector.vLine;
-          io = vo / R;
+        if (sectorPositive) {
           activeState = activeSector.state;
+          vo = Math.max(0, activeSector.vLine);
+          io = vo / R;
         } else {
+          activeState = 'NONE';
           vo = 0;
           io = 0;
-          activeState = 'NONE';
-        }
-      } else if (loadType === 'RL_CONST') {
-        if (freewheelingDiode && activeSector.vLine < 0) {
-          vo = 0;
-          activeState = 'FW';
-        } else {
-          vo = activeSector.vLine;
-          activeState = activeSector.state;
         }
       } else {
-        // Finite RL
-        if (activeSector.vLine > 0) {
+        if (sectorPositive) {
           activeState = activeSector.state;
-        } else if (activeState === activeSector.state && freewheelingDiode && io > 0) {
-          activeState = 'FW';
+        } else {
+          const matchedCur = sectorMap.find((s) => s.state === activeState);
+          if (
+            matchedCur &&
+            freewheelingDiode &&
+            (matchedCur.vLine < 0 || (matchedCur.vLine <= 1e-9 && matchedCur.dvLine < 0))
+          ) {
+            activeState = io > 1e-9 ? 'FW' : 'NONE';
+          }
         }
 
         const matched = sectorMap.find((s) => s.state === activeState);
         if (matched) {
           vo = matched.vLine;
-        } else {
+        } else if (activeState === 'FW') {
           vo = 0;
-        }
-
-        if (activeState !== 'NONE') {
-          const dio = ((vo - R * io) / effectiveL) * dt;
-          io = io + dio;
-          if (io <= 0) {
-            io = 0;
-            vo = 0;
-            activeState = 'NONE';
-          }
         } else {
+          activeState = 'NONE';
+          vo = 0;
           io = 0;
-          vo = 0;
         }
       }
 
@@ -535,7 +608,6 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
         if (matched.pPos === 'C') ic = io;
         if (matched.pNeg === 'C') ic = -io;
 
-        // Voltage across T1/D1 (top Phase A switch)
         if (matched.pPos === 'A') {
           vSwitch1 = 0;
         } else if (matched.pPos === 'B') {
@@ -555,72 +627,107 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
       }
     }
 
-    // Record the last 2 full cycles (720 degrees) at 1-degree intervals
-    const startRecordStep = (totalCycles - 2) * stepsPerCycle;
-    if (step >= startRecordStep && (step - startRecordStep) % 2 === 0) {
-      const recordedDeg = (step - startRecordStep) * dDeg;
-      rawSteadyState.push({
-        deg: recordedDeg,
-        rad: recordedDeg * DEG_TO_RAD,
-        va: v.va,
-        vb: v.vb,
-        vc: v.vc,
-        vab: v.vab,
-        vac: v.vac,
-        vbc: v.vbc,
-        vba: v.vba,
-        vca: v.vca,
-        vcb: v.vcb,
-        vo,
-        io,
-        ia,
-        ib,
-        ic,
-        ifw,
-        vSwitch1,
-        gatePulse,
-        activeDevices,
-        activePathLabel,
-      });
-    }
-  }
+    return {
+      deg: 0,
+      rad: 0,
+      va: v.va,
+      vb: v.vb,
+      vc: v.vc,
+      vab: v.vab,
+      vac: v.vac,
+      vbc: v.vbc,
+      vba: v.vba,
+      vca: v.vca,
+      vcb: v.vcb,
+      vo,
+      io,
+      ia,
+      ib,
+      ic,
+      ifw,
+      vSwitch1,
+      gatePulse,
+      activeDevices,
+      activePathLabel,
+    };
+  };
 
-  // If loadType === 'RL_CONST', compute constant DC link current Idc = max(0, Vdc / R)
-  // (or nominal current if in inverter mode with active DC source)
-  if (loadType === 'RL_CONST') {
-    const avgVo =
-      rawSteadyState.slice(0, 360).reduce((acc, p) => acc + p.vo, 0) / 360;
-    const constId = Math.max(Math.abs(avgVo) / R, Vm / (R * 4));
-    for (const pt of rawSteadyState) {
-      if (pt.activeDevices.length > 0) {
-        pt.io = constId;
-        if (pt.activeDevices.includes('Dfw')) {
-          pt.ifw = constId;
-          pt.ia = 0;
-          pt.ib = 0;
-          pt.ic = 0;
-        } else if (phases === '1p' && waveType === 'half') {
-          pt.ia = constId;
-        } else if (phases === '1p' && waveType === 'full') {
-          pt.ia = pt.activeDevices.includes(`${prefix}1`) ? constId : -constId;
-        } else if (phases === '3p' && waveType === 'half') {
-          pt.ia = pt.activeDevices.includes(`${prefix}1`) ? constId : 0;
-          pt.ib = pt.activeDevices.includes(`${prefix}2`) ? constId : 0;
-          pt.ic = pt.activeDevices.includes(`${prefix}3`) ? constId : 0;
-        } else {
-          // 3p full bridge
-          const d = pt.activeDevices;
-          pt.ia = d.includes(`${prefix}1`) ? constId : d.includes(`${prefix}4`) ? -constId : 0;
-          pt.ib = d.includes(`${prefix}3`) ? constId : d.includes(`${prefix}6`) ? -constId : 0;
-          pt.ic = d.includes(`${prefix}5`) ? constId : d.includes(`${prefix}2`) ? -constId : 0;
+  // Run one full 360-degree cycle starting from current (io, activeState)
+  const runOneFullCycle = (cycleIndex: number) => {
+    const startStep = cycleIndex * stepsPerCycle;
+    for (let s = 1; s <= stepsPerCycle; s++) {
+      stepSimulation((startStep + s) * dDeg, true);
+    }
+  };
+
+  // Initialize at deg = 0
+  stepSimulation(0, false);
+
+  if (loadType !== 'R') {
+    // Pass 1: Run 3 cycles and apply Aitken delta-squared fixed-point convergence for CCM RL / RL_CONST
+    runOneFullCycle(0);
+    const i1 = io;
+    runOneFullCycle(1);
+    const i2 = io;
+    runOneFullCycle(2);
+    const i3 = io;
+
+    if (i1 > 1e-6 && i2 > 1e-6 && i3 > 1e-6) {
+      const denom = i3 - 2 * i2 + i1;
+      if (Math.abs(denom) > 1e-12) {
+        const iStar = (i1 * i3 - i2 * i2) / denom;
+        if (Number.isFinite(iStar) && iStar >= 0) {
+          io = iStar;
         }
-      } else {
-        pt.io = 0;
       }
     }
+
+    // Pass 2: Run 3 more cycles and refine steady-state fixed point if needed
+    runOneFullCycle(3);
+    const j1 = io;
+    runOneFullCycle(4);
+    const j2 = io;
+    runOneFullCycle(5);
+    const j3 = io;
+
+    if (j1 > 1e-6 && j2 > 1e-6 && j3 > 1e-6) {
+      const denom2 = j3 - 2 * j2 + j1;
+      if (Math.abs(denom2) > 1e-12) {
+        const jStar = (j1 * j3 - j2 * j2) / denom2;
+        if (Number.isFinite(jStar) && jStar >= 0) {
+          io = jStar;
+        }
+      }
+    }
+
+    // Run 1 uninterrupted settling cycle before recording
+    runOneFullCycle(6);
+  } else {
+    runOneFullCycle(0);
   }
 
-  // Compute numerical integrals over one full 360-degree cycle (indices 0..359)
+  // Record 2 uninterrupted steady-state cycles (720 degrees at 1-degree intervals -> 721 points)
+  const rawSteadyState: WaveformPoint[] = [];
+  const recordStartCycle = loadType !== 'R' ? 7 : 1;
+  const recordStartStep = recordStartCycle * stepsPerCycle;
+
+  // Point at recordedDeg = 0
+  const pt0 = stepSimulation(recordStartStep * dDeg, false);
+  pt0.deg = 0;
+  pt0.rad = 0;
+  rawSteadyState.push(pt0);
+
+  for (let s = 1; s <= 2 * stepsPerCycle; s++) {
+    const pt = stepSimulation((recordStartStep + s) * dDeg, true);
+    if (s % 2 === 0) {
+      const recordedDeg = s * dDeg;
+      pt.deg = recordedDeg;
+      pt.rad = recordedDeg * DEG_TO_RAD;
+      rawSteadyState.push(pt);
+    }
+  }
+
+  // Compute numerical integrals over one full 360-degree steady-state cycle (indices 0..359)
   const cyclePoints = rawSteadyState.slice(0, 360);
   const N = cyclePoints.length;
 
@@ -628,6 +735,8 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
   let sumVoSq = 0;
   let sumIo = 0;
   let sumIoSq = 0;
+  let sumVoIo = 0;
+  let sumPin = 0;
   let minSwitchV = 0;
   let conductingCount = 0;
   let lastConductingDeg = 0;
@@ -637,6 +746,14 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
     sumVoSq += pt.vo * pt.vo;
     sumIo += pt.io;
     sumIoSq += pt.io * pt.io;
+    sumVoIo += pt.vo * pt.io;
+
+    const instPin =
+      phases === '1p'
+        ? pt.va * pt.ia
+        : pt.va * pt.ia + pt.vb * pt.ib + pt.vc * pt.ic;
+    sumPin += instPin;
+
     if (pt.vSwitch1 < minSwitchV) {
       minSwitchV = pt.vSwitch1;
     }
@@ -650,13 +767,18 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
   const Vrms = Math.sqrt(sumVoSq / N);
   const Idc = sumIo / N;
   const Irms = Math.sqrt(sumIoSq / N);
+
+  // Actual average output real power and input real power from instantaneous samples
+  const Pout = sumVoIo / N;
+  const Pin = sumPin / N;
   const Pdc = Vdc * Idc;
-  const Pac = Vrms * Irms;
+  const Pac = Pin;
 
   const absVdc = Math.max(Math.abs(Vdc), 0.001);
   const formFactor = Vrms / absVdc;
   const rippleFactorPercent = Math.sqrt(Math.max(0, formFactor * formFactor - 1)) * 100;
-  const efficiencyPercent = Pac > 0.001 ? Math.min(100, (Math.abs(Pdc) / Pac) * 100) : 0;
+  const efficiencyPercent =
+    Pin > 1e-3 && Pout >= 0 ? Math.min(100, (Pout / Pin) * 100) : null;
 
   // Theoretical PIV
   const piv = phases === '3p' ? Math.sqrt(3) * Vm : Vm;
@@ -751,7 +873,9 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
     topologySubtitle = `1-Pulse Converter · Single Switch (${prefix}1)`;
     theoreticalFormula =
       deviceType === 'diode'
-        ? 'Vdc = Vm / π ≈ 0.318 Vm'
+        ? loadType === 'R' || freewheelingDiode
+          ? 'Vdc = Vm / π ≈ 0.318 Vm'
+          : 'Vdc = (Vm / 2π) · (1 - cos β) [RL load, β > 180°]'
         : loadType === 'R' || freewheelingDiode
           ? 'Vdc = (Vm / 2π) · (1 + cos α)'
           : 'Vdc = (Vm / 2π) · (cos α - cos β)';
@@ -791,6 +915,8 @@ export function runRectifierSimulation(params: SimulationParams): SimulationResu
       Vrms,
       Idc,
       Irms,
+      Pout,
+      Pin,
       Pdc,
       Pac,
       formFactor,

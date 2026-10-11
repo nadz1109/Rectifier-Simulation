@@ -573,7 +573,7 @@ export default function App() {
                 <span className="text-xs font-mono text-slate-400 ml-1">V</span>
               </div>
               <div className="mt-0.5 text-[11px] font-mono text-slate-400 tabular-nums">
-                Pdc: {metrics.Pdc.toFixed(0)} W
+                Pout: {metrics.Pout.toFixed(0)} W
               </div>
             </div>
 
